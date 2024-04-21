@@ -1,0 +1,26 @@
+.root {
+  margin: 0px auto;
+  padding: 20px 50px;
+  max-width: 1000px;
+
+  .header {
+    display: flex;
+    gap: 30px;
+    align-items: baseline;
+
+    h2 {
+      font-size: 14px;
+      font-weight: bold;
+    }
+
+    a {
+      font-size: 14px;
+
+      color: var(--muted-foreground);
+      font-weight: 500;
+      text-decoration: none;
+    }
+
+    margin-bottom: 20px;
+  }
+}

@@ -1,0 +1,22 @@
+.button {
+  border-radius: 5px;
+  background-color: var(--white);
+  color: var(--background);
+  font-family: Inter Tight, sans-serif;
+  font-weight: 600;
+  font-size: 14px;
+
+  padding: 8px 12px;
+  cursor: pointer;
+  border: none;
+  transition: 250ms ease-in-out all;
+  display: block;
+}
+
+.button:hover {
+  background-color: var(--off-white);
+}
+
+.link {
+  text-decoration: none;
+}
