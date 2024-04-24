@@ -1,9 +1,9 @@
-FROM node:20
+FROM node:20-alpine
 WORKDIR /src
 COPY . .
 RUN rm -rf .next/ && yarn && yarn build && npx prisma generate
 
-FROM node:20
+FROM node:20-alpine
 WORKDIR /app
 
 COPY --from=0 /src/build /app/build
