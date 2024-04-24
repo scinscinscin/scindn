@@ -4,23 +4,30 @@ import { generateSaltFunction } from "../utils/lib/generateSaltFunction.js";
 import { db } from "../utils/prisma.js";
 import { unTypeSafeRouter } from "./index.js";
 import { z } from "zod";
-import Express, { NextFunction, Request, Response } from "express";
+import Express from "express";
 import cors from "cors";
-import formidable, { File } from "formidable";
+import { File } from "formidable";
 import { FileMimeType } from "../utils/mime.js";
 import path from "path";
-import { mkdir, rename, rm } from "fs/promises";
+import { copyFile, mkdir, rm } from "fs/promises";
 import { Project } from "@prisma/client";
-import crypto from "crypto";
-
-const generateRandom = generateSaltFunction({ type: "url-safe", length: 128 });
-const generateFilename = generateSaltFunction({ type: "alphanumeric", length: 40 });
-
-export const signedUrls = new Map<string, string>();
-const projectCache = new Map<string, Project & { parsedOrigins: string[] }>();
+import { handleAsync } from "../utils/handleAsync.js";
+import { multipartFormParser } from "../utils/parser.js";
+import { decryptedValidator, scindnCipher } from "../../packages/encrypt.js";
 
 const staticFolderPath = path.join(process.cwd(), "./public/static");
+const generateRandom = generateSaltFunction({ type: "alphanumeric", length: 128 });
+const generateFilename = generateSaltFunction({ type: "alphanumeric", length: 40 });
 
+/**
+ * Maps a signed url to the project it's assigned to and the key to use when sending response
+ */
+export const signedUrls = new Map<string, { secret: string; key: string }>();
+
+/**
+ * Maps a project secret to the project object and the list of allowed js origins
+ */
+const projectCache = new Map<string, Project & { parsedOrigins: string[] }>();
 (async () => {
   const projects = await db.project.findMany();
   for (const proj of projects)
@@ -29,6 +36,12 @@ const staticFolderPath = path.join(process.cwd(), "./public/static");
       parsedOrigins: JSON.parse(proj.jsOrigins),
     });
 })();
+
+const generateLinkValidator = z.object({
+  secret: z.string(),
+  key: z.string(),
+  timeoutSeconds: z.number().max(3600).optional(),
+});
 
 export const projectRouter = unTypeSafeRouter.sub("/project", {
   "/create": {
@@ -56,7 +69,6 @@ export const projectRouter = unTypeSafeRouter.sub("/project", {
           },
         });
 
-        console.log("Created a new project:", newProject);
         const clientFolderPath = path.join(staticFolderPath, `./${newProject.uuid}`);
         await mkdir(clientFolderPath);
 
@@ -69,24 +81,17 @@ export const projectRouter = unTypeSafeRouter.sub("/project", {
   },
 
   "/generateLink": {
-    post: baseProcedure
-      .input(z.object({ secret: z.string(), timeoutSeconds: z.number().max(3600).optional() }))
-      .use(async (req, res, { input }) => {
-        const project = await db.project.findFirst({ where: { secret: input.secret } });
-        if (!project) throw new ERPCError({ code: "BAD_REQUEST", message: "No project found with that secret" });
+    post: baseProcedure.input(generateLinkValidator).use(async (req, res, { input }) => {
+      const project = await db.project.findFirst({ where: { secret: input.secret } });
+      if (!project) throw new ERPCError({ code: "BAD_REQUEST", message: "No project found with that secret" });
 
-        const hash = await generateRandom();
-        signedUrls.set(hash, project.secret);
+      const hash = await generateRandom();
+      signedUrls.set(hash, { key: input.key, secret: project.secret });
 
-        if (input.timeoutSeconds) {
-          setTimeout(() => {
-            signedUrls.delete(hash);
-          }, input.timeoutSeconds);
-        }
-
-        const link = `/upload/${hash}`;
-        return { link };
-      }),
+      if (input.timeoutSeconds) setTimeout(() => signedUrls.delete(hash), input.timeoutSeconds * 1000);
+      const link = `/upload/${hash}`;
+      return { link };
+    }),
   },
 
   "/delete": {
@@ -101,36 +106,28 @@ export const projectRouter = unTypeSafeRouter.sub("/project", {
         if (!absolutePath.startsWith(staticFolderPath))
           throw new ERPCError({ code: "SERVER_ERROR", message: "Internal server error" });
 
-        console.log("deleting", absolutePath);
         rm(absolutePath);
         return { success: true };
       }),
   },
 });
 
-type Handler<T> = (req: Request, res: Response, next: NextFunction) => T;
-const handleAsync = (handler: Handler<Promise<void>>): Handler<void> => {
-  return (req, res, next) => {
-    handler(req, res, next).catch((err) => {
-      console.log("error in handler", err);
-      const msg = err instanceof Error ? err.message : typeof err === "string" ? err : "Internal Server Error";
-      res.status(500).send(msg);
-    });
-  };
-};
-
 export const hookScinDN = (app: Express.Express) => {
   app.use(
     "/upload/:hash",
     handleAsync(async (req, res, next) => {
-      const projectSecret = signedUrls.get(req.params.hash);
-      if (projectSecret == undefined) throw "Invalid upload link";
+      try {
+        const { key, secret } = signedUrls.get(req.params.hash)!;
+        const project = projectCache.get(secret)!;
 
-      const project = projectCache.get(projectSecret)!;
-      if (!project) throw "No project associated with secret";
+        res.locals.project = project;
+        res.locals.key = key;
 
-      res.locals.project = project;
-      return cors({ credentials: true, origin: project.parsedOrigins })(req, res, next);
+        return cors({ credentials: true, origin: project.parsedOrigins })(req, res, next);
+      } catch (err) {
+        console.log("Error while processing CORS request:", err);
+        throw new Error("Internal server error");
+      }
     })
   );
 
@@ -138,65 +135,39 @@ export const hookScinDN = (app: Express.Express) => {
     "/upload/:hash",
     multipartFormParser,
     handleAsync(async (req, res, next) => {
-      signedUrls.delete(req.params.hash);
-      const project = res.locals.project as Project;
-      const parsedFiles = [] as { bytes: number; originalFilename: string; link: string }[];
-
+      const { key, project } = res.locals as { project: Project; key: string };
       const files = req.body as File[];
+
+      const parsedFiles = [] as { bytes: number; originalFilename: string; link: string }[];
       for (const file of files) {
-        if (!file.mimetype) continue;
-        const extension = FileMimeType[file.mimetype];
-
-        if (!extension) continue;
-
-        const slug = await generateFilename();
-        const filename = `${slug}.${extension}`;
-
-        const bucketPath = `/${project.uuid}/${filename}`;
-        const absolutePath = path.join(staticFolderPath, bucketPath);
-
-        rename(file.filepath, absolutePath);
-        parsedFiles.push({
-          bytes: file.size,
-          link: bucketPath,
-          originalFilename: file.originalFilename as string,
-        });
+        try {
+          const result = await processFile(file, project.uuid);
+          parsedFiles.push(result);
+        } catch (err) {
+          console.error("Failed to process file because:", err);
+        }
       }
 
-      const payload = JSON.stringify({ signedAt: Date.now(), files: parsedFiles });
-      const iv = crypto.randomBytes(16);
-      const cipher = crypto.createCipheriv(
-        "aes-128-cbc",
-        crypto.scryptSync(project.secret, "open-internet-gamers", 16),
-        iv
-      );
-
-      const encrypted = cipher.update(payload, "utf8", "hex") + cipher.final("hex");
-      res.send(`${encrypted}|${iv.toString("hex")}`);
+      const payload: z.infer<typeof decryptedValidator> = { signedAt: Date.now(), files: parsedFiles };
+      const encrypted = scindnCipher.$encrypt(project.secret, key, JSON.stringify(payload));
+      res.send(encrypted);
+      signedUrls.delete(req.params.hash);
     })
   );
 };
 
-const multipartFormParser = handleAsync(async (req, res, next) => {
-  const form = formidable({ multiples: true });
+async function processFile(file: File, projectUuid: string) {
+  if (!file.mimetype) throw new Error("File does not contain mimetype");
+  const extension = FileMimeType[file.mimetype];
 
-  try {
-    const result = await new Promise<{ [x: string]: string | string[] | formidable.File | formidable.File[] }>(
-      (resolve, reject) => {
-        form.parse(req, (err, fields, files) => {
-          if (err) reject(err);
-          else resolve({ ...fields, ...files });
-        });
-      }
-    );
+  if (!extension) throw new Error("File does not contain mimetype");
 
-    if (result.files == undefined) throw new Error(`No field "files" found in body`);
-    else if (Array.isArray(result.files) == false) throw new Error("Files found but it's not an array");
+  const slug = await generateFilename();
+  const filename = `${slug}.${extension}`;
 
-    const files = (result.files as (string | File)[]).filter((x) => typeof (x as any).filepath === "string");
-    req.body = files;
-    next();
-  } catch {
-    throw new Error("Failed to parse multipart/form-data body");
-  }
-});
+  const bucketPath = `/${projectUuid}/${filename}`;
+  const absolutePath = path.join(staticFolderPath, bucketPath);
+
+  await copyFile(file.filepath, absolutePath);
+  return { bytes: file.size, link: bucketPath, originalFilename: file.originalFilename as string };
+}

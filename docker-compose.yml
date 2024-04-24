@@ -1,0 +1,13 @@
+services:
+  scindn:
+    image: "scindn"
+    environment:
+      - JWT_SECRET="some-very-long-random-key-atleast-32-chars-long"
+      - DATABASE_URL=file:/data/database.sqlite
+    volumes:
+      # Make sure the folder has a database.sqlite file
+      - ./prisma/:/data
+      # The directory where all uploaded files go
+      - ./public/static:/app/public/static
+    ports:
+      - 8000:8000
