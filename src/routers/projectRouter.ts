@@ -13,7 +13,7 @@ import { copyFile, mkdir, rm } from "fs/promises";
 import { Project } from "@prisma/client";
 import { handleAsync } from "../utils/handleAsync.js";
 import { multipartFormParser } from "../utils/parser.js";
-import { decryptedValidator, scindnCipher } from "../../packages/encrypt.js";
+import { decryptedValidator, scindnCipher } from "../utils/encrypt.js";
 
 const staticFolderPath = path.join(process.cwd(), "./public/static");
 const generateRandom = generateSaltFunction({ type: "alphanumeric", length: 128 });
